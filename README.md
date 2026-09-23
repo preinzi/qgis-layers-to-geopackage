@@ -1,4 +1,4 @@
-# Layer(s) to GeoPackage
+# <img src="images/icon.png" width="100" alt="Icon">Layer(s) to GeoPackage
 
 A QGIS Processing script that bulk-exports a selection of layers already loaded in your project — vector, non-spatial tables, and raster — into a single target GeoPackage, and optionally reloads the result into the project as a tidy layer tree group.
 
