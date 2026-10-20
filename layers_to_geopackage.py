@@ -26,6 +26,11 @@ Behavior:
 - Optionally, the successfully exported layers are added back to the
   project afterwards, collected in a layer tree group named after
   the GeoPackage, each keeping its original layer name.
+- "Overwrite" off (default): an existing GeoPackage is kept; exported
+  layers are added to it, and a table with the same name is replaced.
+  "Overwrite" on: the file is deleted and created anew - the tool stops
+  with a message instead if that file is currently loaded in the
+  project or cannot be deleted.
 
 Installation:
 1. Save this file somewhere (e.g. as layers_to_geopackage.py).
@@ -57,12 +62,12 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterDefinition,
+    QgsProviderRegistry,
     QgsVectorLayer,
     QgsRasterLayer,
     QgsWkbTypes,
     QgsVectorFileWriter,
     QgsCoordinateTransform,
-    QgsProject,
 )
 
 try:
@@ -148,7 +153,11 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
             '- Mesh, point cloud, vector tile, annotation and plugin '
             'layers are not supported and are skipped.\n'
             '- Optionally, exported layers are added back to the project '
-            'afterwards in a layer tree group named after the GeoPackage.'
+            'afterwards in a layer tree group named after the GeoPackage.\n'
+            '- Overwrite off: an existing GeoPackage is kept, exported layers '
+            'are added and tables with the same name are replaced. Overwrite '
+            'on: the file is recreated; this stops with a message if the file '
+            'is currently loaded in the project.'
         )
 
     def initAlgorithm(self, config=None):
@@ -263,15 +272,42 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
         return names
 
     @staticmethod
-    def _remove_existing_gpkg(path, feedback, attempts=5, delay=0.3):
+    def _normalized_path(path):
+        """Path form suitable for comparing two paths on any OS (absolute,
+        normalized separators, case-insensitive where the OS is)."""
+        return os.path.normcase(os.path.abspath(path))
+
+    def _project_layers_using_file(self, path, project):
+        """Returns the names of all project layers whose data source is
+        the given file. Used before overwriting: deleting a GeoPackage
+        that QGIS still has open fails on Windows, and on Linux it leaves
+        those project layers pointing at a file that no longer exists."""
+        if project is None:
+            return []
+        target = self._normalized_path(path)
+        hits = []
+        for lyr in project.mapLayers().values():
+            source = lyr.source()
+            try:
+                src_path = QgsProviderRegistry.instance().decodeUri(
+                    lyr.providerType(), source).get('path') or ''
+            except Exception:
+                src_path = ''
+            if src_path:
+                if self._normalized_path(src_path) == target:
+                    hits.append(lyr.name())
+            elif target in os.path.normcase(source):
+                hits.append(lyr.name())
+        return hits
+
+    @staticmethod
+    def _remove_existing_gpkg(path, attempts=5, delay=0.3):
         """Deletes an existing destination file, including SQLite side
-        files. Retries on failure: on Windows, a file that was only just
-        closed (e.g. a GeoPackage that was still loaded as a project
-        layer a moment ago) can briefly stay locked by the OS/another
-        process - the first delete attempt then fails with
-        PermissionError (WinError 32) even though nothing is actually
-        wrong. A short retry loop resolves this in almost all cases
-        instead of failing outright on the first try."""
+        files. Retries first: on Windows, a file that was only just closed
+        can briefly stay locked (PermissionError, WinError 32). If it still
+        cannot be deleted, the run stops - continuing would leave the old
+        file (or a stale SQLite journal next to a new file) in place and
+        produce confusing per-layer errors."""
         for suffix in ('', '-wal', '-shm', '-journal'):
             candidate = path + suffix
             if not os.path.exists(candidate):
@@ -286,10 +322,61 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
                     last_exc = exc
                     time.sleep(delay)
             if last_exc is not None:
-                feedback.reportError(
-                    f"Could not delete existing file '{candidate}' after "
-                    f"{attempts} attempts: {last_exc}"
+                raise QgsProcessingException(
+                    f"Could not delete the existing file '{candidate}' "
+                    f"({last_exc}). It is probably still open in QGIS or "
+                    'another program. Close it there, or choose a different '
+                    'target file.'
                 )
+
+    @staticmethod
+    def _drop_existing_table(path, table_name, feedback, cleanup=False):
+        """Removes a table with the given name from an existing GeoPackage.
+        Uses GDAL's GeoPackage-aware DROP TABLE, which also cleans up the
+        metadata (gpkg_contents, tile matrix, spatial index, gridded
+        coverage tables) for vector, attribute and raster tables alike.
+
+        Two uses: before writing, so the new layer replaces an existing
+        table with the same name (without this, a raster table with an
+        existing name cannot be written at all: "table already exists");
+        and with cleanup=True after a failed or canceled write, so no
+        incomplete table is left behind for a layer reported as not
+        exported. Returns False if the table exists but could not be
+        removed."""
+        if not GDAL_AVAILABLE:
+            return True
+        ds = None
+        try:
+            ds = gdal.OpenEx(path, gdal.OF_UPDATE)
+            sql = ds.ExecuteSQL(
+                'SELECT table_name FROM gpkg_contents '
+                f"WHERE lower(table_name) = lower('{table_name}')"
+            )
+            existing = [f.GetField(0) for f in sql] if sql is not None else []
+            if sql is not None:
+                ds.ReleaseResultSet(sql)
+            for name in existing:
+                ds.ExecuteSQL(f'DROP TABLE "{name}"')
+                feedback.pushInfo(
+                    f"Removed incomplete table '{name}' from the GeoPackage."
+                    if cleanup else
+                    f"Replacing existing table '{name}' in the GeoPackage."
+                )
+            return True
+        except Exception as exc:
+            if cleanup:
+                feedback.reportError(
+                    f"Could not remove the incomplete table '{table_name}' from "
+                    f"the GeoPackage ({exc}) - please delete it manually."
+                )
+            else:
+                feedback.reportError(
+                    f"Could not replace the existing table '{table_name}' in the "
+                    f"GeoPackage ({exc}) - layer skipped."
+                )
+            return False
+        finally:
+            ds = None
 
     @staticmethod
     def _gdal_cancel_callback(feedback):
@@ -328,15 +415,73 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
         finally:
             gdal.PopErrorHandler()
 
+    @staticmethod
+    def _log_vector_reprojection(layer, ct, target_crs, feedback):
+        """Logs the layer extent before and after reprojection and warns if
+        the transform left the coordinates untouched (typical symptom of a
+        silently failed transform, e.g. a missing PROJ grid).
+
+        Diagnostic only: it runs separately from the export and must never
+        stop it. For example, an empty layer has a "null" extent that
+        cannot be transformed at all - the layer itself exports fine."""
+        source_name = layer.crs().authid() or layer.crs().description() or 'custom CRS'
+        target_name = target_crs.authid() or target_crs.description() or 'custom CRS'
+        try:
+            original_extent = layer.extent()
+            if original_extent.isNull():
+                feedback.pushInfo(
+                    f"Layer '{layer.name()}': reprojecting from {source_name} "
+                    f"to {target_name} (layer has no features, so there is "
+                    'no extent to compare).'
+                )
+                return
+            transformed_extent = ct.transformBoundingBox(original_extent)
+        except Exception as exc:
+            feedback.pushWarning(
+                f"Layer '{layer.name()}': reprojecting from {source_name} to "
+                f"{target_name}, but the reprojected extent could not be "
+                f'computed for the log ({exc}). The export continues - '
+                'please check the result.'
+            )
+            return
+
+        feedback.pushInfo(
+            f"Layer '{layer.name()}': reprojecting from {source_name} "
+            f"({original_extent.toString(1)}) to {target_name} "
+            f"({transformed_extent.toString(1)})."
+        )
+        # Two different, valid CRSs producing a bit-identical bounding box
+        # does not happen with real data, so this is a reliable check
+        # rather than something to judge from the numbers.
+        unchanged = (
+            abs(transformed_extent.xMinimum() - original_extent.xMinimum()) < 1e-9
+            and abs(transformed_extent.yMinimum() - original_extent.yMinimum()) < 1e-9
+            and abs(transformed_extent.xMaximum() - original_extent.xMaximum()) < 1e-9
+            and abs(transformed_extent.yMaximum() - original_extent.yMaximum()) < 1e-9
+        )
+        if unchanged:
+            feedback.pushWarning(
+                f"Layer '{layer.name()}': the extent is identical before and "
+                'after reprojection, even though the source and target CRS '
+                'differ. This usually means the transform silently failed - '
+                'check for missing PROJ transformation grids (Settings > '
+                'Options > CRS Handling).'
+            )
+
     def _write_vector_layer(self, layer, output_path, layer_name, target_crs,
-                             transform_context, is_first_write, feedback):
+                             transform_context, feedback):
         try:
             options = QgsVectorFileWriter.SaveVectorOptions()
             options.driverName = 'GPKG'
             options.layerName = layer_name
+            # Only create a new file if there is none yet. With an existing
+            # file, CreateOrOverwriteFile would delete the whole GeoPackage
+            # (including tables this run never touched); CreateOrOverwriteLayer
+            # only adds/replaces this one table.
             options.actionOnExistingFile = (
-                QgsVectorFileWriter.CreateOrOverwriteFile if is_first_write
-                else QgsVectorFileWriter.CreateOrOverwriteLayer
+                QgsVectorFileWriter.CreateOrOverwriteLayer
+                if os.path.exists(output_path)
+                else QgsVectorFileWriter.CreateOrOverwriteFile
             )
             # Lets QGIS cancel writing in the middle of a large layer
             # table, instead of only between layers in the outer loop.
@@ -346,40 +491,26 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
             except Exception:
                 options.fileEncoding = 'UTF-8'
 
-            if target_crs.isValid() and layer.crs() != target_crs:
-                original_extent = layer.extent()
-                options.ct = QgsCoordinateTransform(layer.crs(), target_crs, transform_context)
-                transformed_extent = options.ct.transformBoundingBox(original_extent)
-
-                # A transform that silently failed (e.g. a missing PROJ
-                # grid) typically leaves the coordinates untouched rather
-                # than raising an error. Two different, valid CRSs
-                # "coincidentally" producing a bit-identical bounding box
-                # is not realistically going to happen with real data, so
-                # this is a reliable check rather than something to eyeball.
-                unchanged = (
-                    abs(transformed_extent.xMinimum() - original_extent.xMinimum()) < 1e-9
-                    and abs(transformed_extent.yMinimum() - original_extent.yMinimum()) < 1e-9
-                    and abs(transformed_extent.xMaximum() - original_extent.xMaximum()) < 1e-9
-                    and abs(transformed_extent.yMaximum() - original_extent.yMaximum()) < 1e-9
-                )
-
-                feedback.pushInfo(
-                    f"Layer '{layer.name()}': reprojecting from "
-                    f"{layer.crs().authid() or 'unknown CRS'} "
-                    f"({original_extent.toString(1)}) to "
-                    f"{target_crs.authid()} ({transformed_extent.toString(1)})."
-                )
-                if unchanged:
+            # Tables without geometry have no CRS and nothing to reproject.
+            if target_crs.isValid() and layer.isSpatial() and layer.crs() != target_crs:
+                if not layer.crs().isValid():
                     feedback.pushWarning(
-                        f"Layer '{layer.name()}': the extent is identical "
-                        'before and after reprojection, even though the '
-                        'source and target CRS differ. This usually means '
-                        'the transform silently failed - check for missing '
-                        'PROJ transformation grids (Settings > Options > '
-                        'CRS Handling).'
+                        f"Layer '{layer.name()}' has no valid CRS, so it cannot "
+                        'be reprojected - it is exported with its coordinates '
+                        'unchanged and without a CRS.'
                     )
+                else:
+                    options.ct = QgsCoordinateTransform(
+                        layer.crs(), target_crs, transform_context)
+                    self._log_vector_reprojection(layer, options.ct, target_crs, feedback)
+        except Exception as exc:
+            feedback.reportError(
+                f"Unexpected error preparing vector layer '{layer.name()}' "
+                f"for export: {exc}"
+            )
+            return False
 
+        try:
             result = QgsVectorFileWriter.writeAsVectorFormatV3(
                 layer, output_path, transform_context, options
             )
@@ -401,9 +532,16 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
             if feedback.isCanceled():
                 feedback.pushInfo(f"Vector layer '{layer.name()}': processing canceled.")
             else:
+                hint = ''
+                if 'transform' in str(error_message).lower():
+                    hint = (
+                        " This usually means the CRS assigned to the layer does "
+                        "not match its actual coordinates, or features lie "
+                        "outside the area the target CRS can represent."
+                    )
                 feedback.reportError(
                     f"Error writing vector layer '{layer.name()}' "
-                    f"as '{layer_name}': {error_message}"
+                    f"as '{layer_name}': {error_message}{hint}"
                 )
             return False
         return True
@@ -594,26 +732,48 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
         load_layers = self.parameterAsBoolean(parameters, self.LOAD_LAYERS, context)
         group_name = os.path.splitext(os.path.basename(output_path))[0]
 
-        if overwrite:
-            self._remove_existing_gpkg(output_path, feedback)
-        else:
-            out_dir = os.path.dirname(output_path)
-            if out_dir and not os.path.exists(out_dir):
-                os.makedirs(out_dir, exist_ok=True)
+        if overwrite and os.path.exists(output_path):
+            in_use = self._project_layers_using_file(output_path, context.project())
+            if in_use:
+                raise QgsProcessingException(
+                    'The target GeoPackage is currently loaded in the project '
+                    f"(layers: {', '.join(in_use)}). Overwriting would delete a "
+                    'file that QGIS still has open. Remove these layers from '
+                    'the project first, or choose a different target file.'
+                )
+            self._remove_existing_gpkg(output_path)
+
+        out_dir = os.path.dirname(output_path)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
 
         layer_names = self._build_unique_names(layers)
-        transform_context = QgsProject.instance().transformContext()
+        transform_context = context.transformContext()
 
-        any_written = False
         exported, warned, failed = [], [], []
 
         total = len(layers)
+        not_processed = []
         for index, layer in enumerate(layers):
             if feedback.isCanceled():
+                not_processed = [lyr.name() for lyr in layers[index:]]
                 break
             feedback.setProgress(int(index / total * 100))
             layer_name = layer_names[layer.id()]
             feedback.pushInfo(f"Processing layer '{layer.name()}' -> table '{layer_name}' ...")
+
+            # Only layers this tool can actually write may replace (or, after
+            # a failed write, clean up) a table in the GeoPackage. A raster
+            # from a web service, for example, is rejected later anyway and
+            # must not remove an existing table with the same name.
+            writable = isinstance(layer, QgsVectorLayer) or (
+                isinstance(layer, QgsRasterLayer)
+                and GDAL_AVAILABLE and layer.providerType() == 'gdal'
+            )
+            if writable and os.path.exists(output_path):
+                if not self._drop_existing_table(output_path, layer_name, feedback):
+                    failed.append(layer.name())
+                    continue
 
             if isinstance(layer, QgsVectorLayer):
                 is_table = (
@@ -630,7 +790,7 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
 
                 success = self._write_vector_layer(
                     layer, output_path, layer_name, target_crs,
-                    transform_context, not any_written, feedback
+                    transform_context, feedback
                 )
 
             elif isinstance(layer, QgsRasterLayer):
@@ -656,7 +816,6 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
                 continue
 
             if success:
-                any_written = True
                 exported.append(layer.name())
                 if load_layers:
                     self._queue_layer_for_loading(
@@ -664,6 +823,12 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
                     )
             else:
                 failed.append(layer.name())
+                # A failed or canceled write can leave an empty or partial
+                # table behind - remove it, so "not exported" also means
+                # "not in the GeoPackage".
+                if writable and os.path.exists(output_path):
+                    self._drop_existing_table(
+                        output_path, layer_name, feedback, cleanup=True)
 
         feedback.pushInfo('---')
         feedback.pushInfo(f'Successfully exported: {len(exported)} of {total} layer(s).')
@@ -671,5 +836,8 @@ class LayersToGeoPackage(QgsProcessingAlgorithm):
             feedback.pushInfo(f"Exported with a warning: {', '.join(warned)}")
         if failed:
             feedback.pushInfo(f"Not exported (see messages above): {', '.join(failed)}")
+        if not_processed:
+            feedback.pushInfo(
+                f"Run canceled - not processed: {', '.join(not_processed)}")
 
         return {self.OUTPUT_GPKG: output_path}
