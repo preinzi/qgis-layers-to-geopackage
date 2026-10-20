@@ -15,8 +15,8 @@ Given a list of project layers you tick in the Processing dialog, this tool:
 - Logs each layer's extent before and after reprojection, and explicitly flags the case where a transform silently produced no change (a common symptom of a missing PROJ grid) rather than leaving you to guess from the numbers.
 - Skips layer types that can't be meaningfully written to a GeoPackage (mesh, point cloud, vector tile, annotation, plugin layers), reporting each as an error rather than failing the whole run.
 - Optionally reloads every successfully exported layer back into the project afterwards, collected in a layer tree group named after the GeoPackage, each keeping its original layer name.
-- Cancellable mid-run, including partway through writing a single large layer, not just between layers.
-- Robust to a couple of real-world rough edges: retries deleting an existing output file if Windows briefly still has it locked, and surfaces GDAL warnings that `gdal.UseExceptions()` alone would leave silent.
+- Cancelable mid-run, including partway through writing a single large layer, not just between layers.
+- Robust to a couple of real-world rough edges: retries deleting an existing output file if Windows briefly still has it locked, refuses to overwrite a GeoPackage that is currently loaded in the project, removes the incomplete table of a layer that failed or was canceled (so "not exported" also means "not in the GeoPackage"), and surfaces GDAL warnings that `gdal.UseExceptions()` alone would leave silent.
 
 ## Installation
 
@@ -26,7 +26,7 @@ This is a single-file **Processing script**, not a full plugin:
 2. In QGIS: **Processing → Toolbox → Scripts (gear icon) → Add Script to Toolbox…**, and select the file.
 3. It will appear under **Scripts → LiberGIS → Layer(s) to GeoPackage**.
 
-No extra Python packages required beyond what ships with QGIS (uses only the Python standard library plus the bundled GDAL/PyQGIS). Tested on QGIS 3.34 and 3.44 LTR (Windows).
+No extra Python packages required beyond what ships with QGIS (uses only the Python standard library plus the bundled GDAL/PyQGIS). Tested on QGIS 3.44 LTR (Windows), 3.34 LTR (Linux) and 4.2 (Linux).
 
 ## Usage
 
@@ -38,7 +38,7 @@ No extra Python packages required beyond what ships with QGIS (uses only the Pyt
 | **Resampling method for rasters** *(default: Cubic)* | Only used when a target CRS is set and a raster actually needs reprojecting |
 | **Tile format / compression for raster layers** *(Advanced, default: Automatic)* | PNG (lossless), PNG8, JPEG, or WEBP (lossy) |
 | **Quality for JPEG/WEBP** *(Advanced, default: 75)* | 1–100, only relevant for those two formats |
-| **Overwrite existing target GeoPackage** *(default: off)* | On: deletes and recreates the file. Off: adds to / replaces layers within an existing file |
+| **Overwrite existing target GeoPackage** *(default: off)* | Off: adds the layers to an existing file and replaces tables with the same name; everything else in the file is kept. On: deletes and recreates the file — stops with a message instead if the file is currently loaded in the project |
 | **Add exported layers to the project…** *(default: on)* | Reloads the result into the project, grouped in a layer tree group named after the GeoPackage |
 
 ### Output
